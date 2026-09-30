@@ -1,0 +1,72 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Búsqueda p95",
+      "id": 1,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ms", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1000 }] } }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(document_search_duration_seconds_bucket[5m])) by (le)) * 1000", "legendFormat": "p95", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Solicitudes por segundo",
+      "id": 2,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "targets": [{ "expr": "sum(rate(document_api_http_requests_total[5m])) by (path, status)", "legendFormat": "{{path}} · {{status}}", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Documentos aceptados",
+      "id": 3,
+      "gridPos": { "h": 8, "w": 4, "x": 16, "y": 0 },
+      "targets": [{ "expr": "sum(document_uploads_total)", "legendFormat": "uploads", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Entradas en stream",
+      "id": 4,
+      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 0 },
+      "targets": [{ "expr": "document_processing_stream_length", "legendFormat": "stream", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Procesamiento worker p95",
+      "id": 5,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(document_worker_processing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Reintentos",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 5, "x": 8, "y": 8 },
+      "targets": [{ "expr": "sum(document_worker_retries_total)", "legendFormat": "retries", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Dead letter",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 5, "x": 13, "y": 8 },
+      "targets": [{ "expr": "sum(document_worker_dead_letter_total)", "legendFormat": "DLQ", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Mensajes pendientes",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "targets": [{ "expr": "document_worker_pending_messages", "legendFormat": "pending", "refId": "A" }]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 40,
+  "tags": ["documents", "fts"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "title": "Atlas Docs · Operación",
+  "uid": "atlas-docs",
+  "version": 1
+}

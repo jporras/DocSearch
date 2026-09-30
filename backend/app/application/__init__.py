@@ -1,0 +1,1 @@
+"""Document-search use cases."""

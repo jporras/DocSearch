@@ -1,0 +1,131 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-document_search}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-document_search}"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  migrate:
+    build: ./backend
+    command: ["python", "-m", "app.infrastructure.migrate"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://app:app@postgres:5432/document_search}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://app:app@postgres:5432/document_search}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - uploads:/data/uploads
+    ports:
+      - "${DOCSEARCH_BACKEND_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.workers.document_consumer"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://app:app@postgres:5432/document_search}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - uploads:/data/uploads
+    expose:
+      - "9101"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "${DOCSEARCH_FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - backend
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: ./backend
+      target: test
+    command: ["pytest", "-q"]
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/document_search
+      REDIS_URL: redis://redis:6379/0
+      INTEGRATION_BASE_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+      worker:
+        condition: service_started
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.1.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${DOCSEARCH_PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - backend
+      - worker
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:11.5.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${DOCSEARCH_GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads:
+  grafana_data:
