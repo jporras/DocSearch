@@ -1,6 +1,51 @@
-# Atlas Docs — buscador y visor de documentos técnicos
+# DocSearch — buscador y visor de documentos técnicos
 
-Aplicación Full Stack para cargar TXT, Markdown y PDF con metadatos, procesarlos en segundo plano, buscar sobre título/metadatos/contenido y leerlos sin descargarlos. Implementa PostgreSQL Full-Text Search con índice GIN —sin `LIKE`— y notificaciones SSE sin polling.
+Aplicación Full Stack —presentada en la interfaz como **Atlas Docs**— para
+cargar TXT, Markdown y PDF con metadatos, procesarlos en segundo plano, buscar
+sobre título/metadatos/contenido y leerlos sin descargarlos. Implementa
+PostgreSQL Full-Text Search con índice GIN —sin `LIKE`— y notificaciones SSE
+sin polling.
+
+## Arquitectura en una vista
+
+```mermaid
+flowchart LR
+    UI[Navegador · React] <-->|REST + SSE| NX[Nginx]
+    NX --> API[FastAPI]
+    API -->|estado + FTS| PG[(PostgreSQL)]
+    API -->|XADD| RS[(Redis Streams)]
+    RS --> WK[Worker]
+    API --> FS[(Volumen local)]
+    WK --> FS
+    WK --> PG
+    WK -->|estado| RP[(Redis Pub/Sub)]
+    RP --> API
+    MIG[Migraciones] --> PG
+    PM[Prometheus] --> API
+    PM --> WK
+    GF[Grafana] --> PM
+```
+
+El camino de búsqueda es deliberadamente simple: React → FastAPI →
+PostgreSQL FTS. Redis y el worker solo participan en ingestión y no pueden
+bloquear consultas sobre documentos ya indexados.
+
+## Requisitos cubiertos
+
+- carga individual y masiva de TXT, Markdown y PDF, con metadatos por archivo;
+- validación de contrato, extensión, tamaño, archivo vacío, firma PDF y
+  contenido binario básico;
+- respuesta `202 PROCESSING` sin esperar extracción ni indexación;
+- resultado parcial `REJECTED`/`ERROR` por elemento de lote;
+- búsqueda sobre título, metadatos y contenido con GIN, ranking, paginación y
+  resaltado, sin `LIKE`/`ILIKE`;
+- visor de contenido y metadatos sin descarga obligatoria;
+- estados durables y actualización por SSE sin polling;
+- Redis Streams con consumer group, ACK, recuperación de pendientes,
+  reintentos y DLQ;
+- trazabilidad mediante `document_id`, `correlation_id` y `batch_id`;
+- pruebas unitarias, contratos e integración real reproducibles en Compose;
+- métricas de API/worker y dashboard Grafana opcional.
 
 ## Inicio rápido
 
@@ -26,6 +71,10 @@ docker compose --profile observability up -d
 - Prometheus: <http://localhost:9090>
 - Grafana: <http://localhost:3001> (`admin` / `admin`, sólo para la demo local)
 
+Prometheus consulta la API y el endpoint interno `worker:9101`. El dashboard
+incluye p95 de búsqueda/procesamiento, tráfico, cargas, profundidad del stream,
+reintentos, pendientes y DLQ.
+
 No es necesario crear `.env` para la demo; `compose.yml` incluye valores locales seguros por defecto. Para personalizarlos:
 
 ```powershell
@@ -36,9 +85,13 @@ Copy-Item .env.example .env
 
 1. Abre **Cargar** y selecciona uno o varios archivos, por ejemplo `samples/architecture-guide.md`.
 2. Completa título, autor, categoría, etiquetas y versión.
-3. Comprueba que la API responde `PROCESSING` y que la UI cambia a `INDEXED` mediante SSE, sin refrescar.
+3. Comprueba el resumen del lote, su `batch_id` y que cada documento aceptado
+   cambia de `PROCESSING` a `INDEXED` mediante SSE, sin refrescar.
 4. Busca `arquitectura pagos`, revisa tiempo, ranking y resaltado.
 5. Abre el resultado y muestra el contenido y sus metadatos en el visor.
+6. Desde OpenAPI intenta cargar una extensión no permitida para mostrar el
+   `422`; opcionalmente carga un PDF corrupto con cabecera `%PDF-` para enseñar
+   retries, `ERROR` y DLQ.
 
 También puede cargarse por API:
 
@@ -69,7 +122,27 @@ $response
 | `GET` | `/api/documents/search?q=...&page=1&page_size=10` | FTS paginado y resaltado |
 | `GET` | `/api/documents/{id}` | Contenido y metadatos para el visor |
 
-El tamaño máximo predeterminado es 10 MB. Los formatos permitidos son `.txt`, `.md` y `.pdf` con texto extraíble.
+Los límites predeterminados son 10 MB por archivo, 20 archivos y 50 MB por
+lote. Los formatos permitidos son `.txt`, `.md` y `.pdf` con texto extraíble.
+La respuesta y los eventos conservan `correlation_id`; una carga masiva añade
+`batch_id`. Nginx admite 55 MB para cubrir el lote y el overhead multipart; si
+se aumenta `MAX_BATCH_SIZE_MB`, también debe ajustarse
+`client_max_body_size`.
+
+## Full-Text Search sin `LIKE`
+
+PostgreSQL mantiene un `tsvector` ponderado mediante trigger: título con peso
+A; autor, categoría, etiquetas y versión con peso B; contenido con peso C. La
+consulta real usa `websearch_to_tsquery`, el operador `@@`, `ts_rank_cd` y
+`ts_headline` sobre un índice GIN.
+
+```sql
+WHERE search_vector @@ websearch_to_tsquery('spanish', :query)
+```
+
+Esto proporciona normalización lingüística, ranking y fragmentos resaltados.
+La prueba automatizada inspecciona el adaptador SQL y falla si aparece
+`LIKE`/`ILIKE` en la búsqueda documental.
 
 ## Verificación
 
@@ -79,6 +152,10 @@ SSE y DLQ:
 ```powershell
 docker compose --profile test run --rm tests
 ```
+
+Resultado de la última ejecución completa: **21 passed** —18 pruebas
+unitarias/de contrato y 3 integraciones reales—. Las integraciones cubren carga,
+SSE, FTS, visor, reintentos, DLQ y éxito parcial de un lote.
 
 El servicio efímero de migraciones se ejecuta antes de API y worker. Las
 migraciones aplicadas se registran en `schema_migrations`.
@@ -105,23 +182,20 @@ El reporte muestra media, p50, p95, p99 y falla con código distinto de cero si 
 
 ## Estructura
 
-```text
-backend/app/api/     contratos HTTP, DTO y composición de dependencias
-backend/app/domain/  entidades, estados y reglas puras
-backend/app/application/ casos de uso de carga, búsqueda y procesamiento
-backend/app/ports/   protocolos requeridos por los casos de uso
-backend/app/infrastructure/ adaptadores PostgreSQL, Redis, disco y métricas
-backend/app/workers/ consumidores y orquestación asíncrona
-backend/db/          SQL de inicialización de PostgreSQL
-backend/db/migrations/ cambios de esquema versionados e idempotentes
-frontend/            React + Vite, carga, búsqueda, paginación y visor
-docs/architecture.md decisiones, flujo, resiliencia y escalabilidad
-docs/ia.md           uso obligatorio y transparente de IA
-scripts/             benchmark reproducible
-samples/             documento pequeño para la demo
-observability/       Prometheus y dashboard Grafana opcionales
-compose.yml          entorno unificado
-```
+| Ruta | Responsabilidad |
+|---|---|
+| `backend/app/api/` | Contratos HTTP, DTO y composición de dependencias |
+| `backend/app/domain/` | Estados, metadatos y reglas puras |
+| `backend/app/application/` | Casos de uso de carga, búsqueda y procesamiento |
+| `backend/app/ports/` | Protocolos requeridos por los casos de uso |
+| `backend/app/infrastructure/` | PostgreSQL, Redis, almacenamiento, migraciones y métricas |
+| `backend/app/workers/` | Consumidor y orquestación asíncrona |
+| `backend/db/` | Esquema inicial y migraciones versionadas |
+| `frontend/` | React, Nginx, carga, búsqueda, paginación y visor |
+| `observability/` | Prometheus y dashboard Grafana |
+| `scripts/` | Smoke test y benchmark reproducible |
+| `docs/` | Arquitectura y declaración de uso de IA |
+| `compose.yml` | Entorno reproducible y perfiles opcionales |
 
 ## Decisiones clave
 
@@ -134,6 +208,36 @@ compose.yml          entorno unificado
   prueban con dobles simples.
 - **Trazabilidad durable:** `correlation_id` y `batch_id` viajan por respuesta,
   PostgreSQL, Redis Streams, logs y SSE, incluso después de una reconexión.
+- **Migraciones antes del arranque:** un servicio efímero registra los cambios
+  aplicados en `schema_migrations` antes de iniciar API y worker.
+
+## Código limpio, SOLID y DRY
+
+- **SRP:** rutas, casos de uso, persistencia, mensajería, almacenamiento y
+  extracción tienen responsabilidades separadas.
+- **DIP:** los casos de uso dependen de puertos propios, no de PostgreSQL,
+  Redis, FastAPI o filesystem.
+- **ISP:** los protocolos se orientan a las operaciones que consume la
+  aplicación y evitan repositorios genéricos.
+- **OCP/LSP:** un adaptador puede sustituirse detrás de su contrato cuando
+  exista una necesidad comprobada.
+- **DRY:** estados, normalización, compensaciones y configuración tienen una
+  fuente definida, sin capas de paso creadas solo para aparentar arquitectura.
+
+## Seguridad y validaciones
+
+- extensión permitida, tamaño, archivo vacío, firma básica PDF y detección de
+  datos binarios en TXT/Markdown;
+- nombres internos UUID y archivos fuera del directorio público;
+- metadatos y límites de lote validados;
+- consultas SQL parametrizadas, CORS configurable y errores internos sin
+  detalles sensibles;
+- request limit y rate limit en Nginx;
+- secretos mediante variables de entorno; `.env` no se versiona.
+
+Autenticación, antivirus y TLS terminan fuera del alcance de la demo. Para un
+despliegue real se integrarían OIDC/JWT, RBAC, análisis antimalware y TLS en el
+proxy o balanceador.
 
 Si los puertos predeterminados están ocupados por otro proyecto, pueden
 configurarse sin modificar Compose:
@@ -144,13 +248,24 @@ $env:DOCSEARCH_FRONTEND_PORT = '13000'
 docker compose up --build
 ```
 
-El detalle y los caminos de evolución a Kafka/OpenSearch, almacenamiento de objetos y búsqueda híbrida están en [docs/architecture.md](docs/architecture.md). La declaración de IA está en [docs/ia.md](docs/ia.md).
+## Documentación
+
+- [Arquitectura, flujos, decisiones y evolución](docs/architecture.md)
+- [Uso transparente de inteligencia artificial](docs/ia.md)
+- [Reglas y norte arquitectónico para agentes](AGENTS.md)
 
 ## Limitaciones conocidas
 
 - Los PDF escaneados sin capa de texto requieren OCR, fuera del alcance actual.
 - No se implementó autenticación; para producción se propone OIDC/JWT y RBAC.
 - Redis Pub/Sub no conserva notificaciones, por eso el estado durable vive en PostgreSQL y el SSE siempre entrega un snapshot inicial.
+- PostgreSQL + Redis constituyen un dual write: existe compensación si falla el
+  envío, pero una caída entre commit y `XADD` requeriría un outbox para cerrar
+  completamente la ventana.
+- El no-op de documentos ya `INDEXED` protege redeliveries secuenciales, no dos
+  procesamientos concurrentes del mismo documento.
+- El volumen local permite compartir archivos dentro del mismo host Compose;
+  el escalado multinodo requiere S3/MinIO o almacenamiento compartido.
 
 ## Reinicio limpio del entorno
 
@@ -159,3 +274,11 @@ Sólo si se desea eliminar todos los documentos y datos locales de la demo:
 ```powershell
 docker compose down -v
 ```
+
+## Criterio de ingeniería
+
+> Si una tecnología no puede justificarse en 20–30 segundos indicando qué
+> problema concreto resuelve dentro de DocSearch, no se agrega.
+
+El objetivo no es acumular componentes, sino entregar una solución funcional,
+medible, segura, probada, mantenible y defendible.
